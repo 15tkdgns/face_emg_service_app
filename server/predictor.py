@@ -35,6 +35,18 @@ MODEL_REGISTRY = {
         'f1_per':      {'기쁨': 0.968, '당황': 0.902, '분노': 0.860, '상처': 0.828},
         'use_clahe':   False,
         'use_edge':    False,
+        'emotions':    ['기쁨', '당황', '분노', '상처'],
+    },
+    'densenet121_new': {
+        'label':       'DenseNet121 (재학습)',
+        'description': '새 데이터 재학습 (83.8%)',
+        'onnx':        'densenet121_new.onnx',
+        'color':       '#57B894',
+        'val_acc':     0.8376,
+        'f1_per':      {},
+        'use_clahe':   False,
+        'use_edge':    False,
+        'emotions':    ['기쁨', '당황', '분노', '상처'],
     },
 }
 
@@ -138,18 +150,20 @@ class ModelManager:
         sess = self._get_session(model_id)
         if sess is None:
             return None
-        info   = MODEL_REGISTRY[model_id]
-        tensor = _preprocess(face_rgb, info['use_clahe'], info['use_edge'])
-        t0     = time.time()
-        logits = sess.run(None, {'input': tensor})[0][0]
-        elapsed = (time.time() - t0) * 1000
-        probs  = _softmax(logits)
-        pred   = int(probs.argmax())
+        info     = MODEL_REGISTRY[model_id]
+        emotions = info.get('emotions', EMOTIONS)
+        tensor   = _preprocess(face_rgb, info['use_clahe'], info['use_edge'])
+        t0       = time.time()
+        logits   = sess.run(None, {'input': tensor})[0][0]
+        elapsed  = (time.time() - t0) * 1000
+        probs    = _softmax(logits)
+        pred     = int(probs.argmax())
+        emotion  = emotions[pred]
         return {
-            'emotion':    EMOTIONS[pred],
-            'emoji':      EMOTION_EMOJI[EMOTIONS[pred]],
+            'emotion':    emotion,
+            'emoji':      EMOTION_EMOJI.get(emotion, '🤔'),
             'confidence': float(probs[pred]),
-            'scores':     {e: float(probs[i]) for i, e in enumerate(EMOTIONS)},
+            'scores':     {e: float(probs[i]) for i, e in enumerate(emotions)},
             'infer_ms':   round(elapsed, 1),
         }
 
