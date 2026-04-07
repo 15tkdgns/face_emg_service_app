@@ -34,13 +34,7 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
-manager = ModelManager()
-
-
-@app.on_event('startup')
-async def startup():
-    manager.load_all()
-    logger.info(f'서버 준비. 로드 모델: {list(manager.sessions.keys())}')
+manager = ModelManager()  # lazy loading — 첫 요청 시 모델 자동 로드
 
 
 def _decode_image(contents: bytes) -> np.ndarray:
@@ -58,8 +52,8 @@ def _decode_image(contents: bytes) -> np.ndarray:
 @app.get('/api/health')
 def health():
     return {
-        'status':        'ok',
-        'loaded_models': list(manager.sessions.keys()),
+        'status': 'ok',
+        'models': list(manager.available_models()),
     }
 
 
