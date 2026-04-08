@@ -3,13 +3,14 @@ ONNX Runtime 기반 감정인식 추론기.
 Vercel 서버리스 환경을 위해 lazy loading 사용.
 """
 import base64
+import io
 import logging
 import os
 import time
 
-import cv2
 import numpy as np
 import onnxruntime as ort
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -21,85 +22,48 @@ EMOTION_EMOJI = {'기쁨': '😄', '당황': '😳', '분노': '😡', '상처':
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-FACE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
-)
-
 MODEL_REGISTRY = {
     'densenet121': {
         'label':       'DenseNet121',
         'description': '기본 전처리 · Best 모델 (87.6%)',
-        'onnx':        'densenet121.onnx',
+        'onnx':        'densenet121_q.onnx',
         'color':       '#4F86C6',
         'val_acc':     0.8762,
         'f1_per':      {'기쁨': 0.968, '당황': 0.902, '분노': 0.860, '상처': 0.828},
-        'use_clahe':   False,
-        'use_edge':    False,
         'emotions':    ['기쁨', '당황', '분노', '상처'],
     },
     'densenet121_new': {
         'label':       'DenseNet121 (재학습)',
         'description': '새 데이터 재학습 (83.8%)',
-        'onnx':        'densenet121_new.onnx',
+        'onnx':        'densenet121_new_q.onnx',
         'color':       '#57B894',
         'val_acc':     0.8376,
         'f1_per':      {},
-        'use_clahe':   False,
-        'use_edge':    False,
         'emotions':    ['기쁨', '당황', '분노', '상처'],
     },
 }
 
 
-def _apply_clahe(img_rgb: np.ndarray) -> np.ndarray:
-    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+def detect_and_crop(img_bytes: bytes):
+    """이미지 바이트에서 얼굴 영역을 center crop으로 추출."""
+    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    w, h = img.size
+    s = min(w, h)
+    x1, y1 = (w - s) // 2, (h - s) // 2
+    face = img.crop((x1, y1, x1 + s, y1 + s))
+
+    buf = io.BytesIO()
+    face.save(buf, format='JPEG', quality=85)
+    face_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    return None, np.array(face, dtype=np.uint8), face_b64
 
 
-def _extract_edge(img_rgb: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    return cv2.Canny(gray, 50, 150)
-
-
-def detect_and_crop(img_bgr: np.ndarray):
-    gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    faces = FACE_CASCADE.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30)
-    )
-    if len(faces) == 0:
-        h, w = img_bgr.shape[:2]
-        s = min(h, w)
-        x1, y1 = (w - s) // 2, (h - s) // 2
-        face_bgr = img_bgr[y1:y1 + s, x1:x1 + s]
-        bbox = None
-    else:
-        x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-        px, py = int(fw * 0.1), int(fh * 0.1)
-        x1 = max(0, x - px);  y1 = max(0, y - py)
-        x2 = min(img_bgr.shape[1], x + fw + px)
-        y2 = min(img_bgr.shape[0], y + fh + py)
-        face_bgr = img_bgr[y1:y2, x1:x2]
-        bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
-
-    _, buf = cv2.imencode('.jpg', face_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    face_b64 = base64.b64encode(buf).decode('utf-8')
-    return bbox, cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB), face_b64
-
-
-def _preprocess(face_rgb: np.ndarray, use_clahe: bool, use_edge: bool) -> np.ndarray:
-    face = cv2.resize(face_rgb, (224, 224))
-    if use_clahe:
-        face = _apply_clahe(face)
-    norm = (face.astype(np.float32) / 255.0 - MEAN) / STD
-    rgb  = norm.transpose(2, 0, 1)
-    if use_edge:
-        edge = _extract_edge(face).astype(np.float32) / 255.0
-        tensor = np.concatenate([rgb, edge[np.newaxis]], axis=0)
-    else:
-        tensor = rgb
-    return tensor[np.newaxis].astype(np.float32)
+def _preprocess(face_rgb: np.ndarray) -> np.ndarray:
+    img = Image.fromarray(face_rgb).resize((224, 224), Image.BILINEAR)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    norm = (arr - MEAN) / STD
+    return norm.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
@@ -152,7 +116,7 @@ class ModelManager:
             return None
         info     = MODEL_REGISTRY[model_id]
         emotions = info.get('emotions', EMOTIONS)
-        tensor   = _preprocess(face_rgb, info['use_clahe'], info['use_edge'])
+        tensor   = _preprocess(face_rgb)
         t0       = time.time()
         logits   = sess.run(None, {'input': tensor})[0][0]
         elapsed  = (time.time() - t0) * 1000
